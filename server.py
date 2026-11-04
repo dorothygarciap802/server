@@ -3,18 +3,23 @@
 Standalone server. Python preserves all unsigned 64-bit nonce values.
 """
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import json
 import logging
 import os
+import time
 import unicodedata
+from urllib.parse import parse_qs, urlsplit
+import uuid
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosedOK
 
 # Keep this file standalone; these helpers match the miner's wire protocol.
 MEMO_CAPABILITY = 'payout_memo_v1'
@@ -117,8 +122,90 @@ class Session:
 
 log = logging.getLogger("bnt-proxy")
 
+DASHBOARD = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BNT · Proxy overview</title><style>
+:root{color-scheme:dark;font:14px system-ui,sans-serif;background:#0b0d12;color:#dce1ed}*{box-sizing:border-box}body{margin:0}header{background:#11151d;border-bottom:1px solid #252c39;padding:18px 28px;display:flex;align-items:center;justify-content:space-between;gap:15px}.brand{font-size:19px;font-weight:700}.brand b{color:#ff9830;margin-right:12px}header small,.muted{color:#8290a8}main{max-width:1500px;margin:auto;padding:26px}h1{font-size:25px;margin:0 0 8px}h2{font-size:14px;font-weight:600;margin:0 0 20px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px}.pill{padding:6px 11px;border:1px solid #285746;border-radius:5px;color:#73dfa8;font-size:12px}.pill.bad{color:#ff8a8a;border-color:#663636}.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px}.panel,.card{background:#121720;border:1px solid #252d3c;border-radius:7px;padding:20px}.card span{display:block;color:#91a0b8;font-size:12px}.value{font-size:30px;font-weight:600;line-height:1.6;font-variant-numeric:tabular-nums}.green{color:#72dba1}.red{color:#ff7c83}.orange{color:#ffac54}.charts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}.chart{width:100%;height:170px;display:block;background:repeating-linear-gradient(to top,transparent,transparent 41px,#242c3a 42px)}.legend{font-size:12px;color:#91a0b8;display:flex;justify-content:space-between;margin-top:12px}.section{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:16px}.section h2{margin:0}input,select{background:#0d1119;color:#cfd8e8;border:1px solid #303b4d;border-radius:4px;padding:8px;max-width:100%}.tablewrap{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap;font-size:12px;text-align:left}th{font-weight:500;color:#8998b0;padding:12px 10px;border-bottom:1px solid #30394a}td{padding:13px 10px;border-bottom:1px solid #202735}td:first-child{font-family:monospace;color:#a9bad4}.state{border-radius:4px;padding:4px 7px;background:#202a38;color:#aebed7}.state.live{background:#16392c;color:#7adea8}.events{margin-top:16px}.event{display:flex;gap:20px;padding:10px 0;border-bottom:1px solid #202735;font-size:12px;overflow-wrap:anywhere}.event time{color:#8290a8;min-width:70px}.event code{color:#ffac54;min-width:92px}.empty{color:#8290a8;padding:25px;text-align:center}footer{color:#75839b;font-size:12px;margin-top:18px}.notice{font-size:12px;color:#8290a8;margin:14px 0 0}
+@media(max-width:1000px){.cards{grid-template-columns:repeat(3,1fr)}}@media(max-width:650px){main{padding:14px}header{padding:16px}.cards{grid-template-columns:repeat(2,1fr)}.charts{grid-template-columns:1fr}.toolbar,.section{align-items:flex-start;flex-direction:column}.event{gap:10px;flex-wrap:wrap}}
+</style></head><body><header><div class="brand"><b>◈</b>BNT <small>/ Proxy observability</small></div><span id="health" class="pill">Connecting…</span></header>
+<main><div class="toolbar"><div><h1>Proxy overview</h1><span class="muted" id="upstream">Waiting for telemetry</span></div><span class="muted" id="updated">Live · every 2 seconds</span></div>
+<div class="cards">
+<div class="card"><span>Active connections</span><div class="value" id="active">—</div></div>
+<div class="card"><span>Pool authorized</span><div class="value green" id="authorized">—</div></div>
+<div class="card"><span>Accepted shares</span><div class="value green" id="accepted">—</div></div>
+<div class="card"><span>Rejected shares</span><div class="value red" id="rejected">—</div></div>
+<div class="card"><span>Pending shares</span><div class="value orange" id="pending">—</div></div>
+<div class="card"><span>Session errors</span><div class="value" id="errors">—</div></div></div>
+<div class="charts"><div class="panel"><h2>Active connections</h2><svg id="connectionsChart" class="chart" viewBox="0 0 600 170" preserveAspectRatio="none" aria-label="Active connections over the last six minutes"></svg><div class="legend"><span>Last 6 minutes · 2s samples</span><span id="connectionsScale"></span></div></div>
+<div class="panel"><h2>Share throughput · shares / minute</h2><svg id="sharesChart" class="chart" viewBox="0 0 600 170" preserveAspectRatio="none" aria-label="Accepted and rejected shares per minute"></svg><div class="legend"><span><span class="green">● Accepted</span> &nbsp; <span class="red">● Rejected</span></span><span id="sharesScale"></span></div></div></div>
+<div class="panel"><div class="section"><h2>Connections <span class="muted" id="sessionCount"></span></h2><div><select id="filter" aria-label="Connection filter"><option value="active">Active</option><option value="all">Active + recent closed</option></select> <input id="search" placeholder="Search worker or session" aria-label="Search connections"></div></div><div class="tablewrap"><table><thead><tr><th>Session</th><th>Worker</th><th>Status</th><th>Duration</th><th>Jobs</th><th>Accepted</th><th>Rejected</th><th>Pending</th><th>Pool ACK</th><th>Last activity</th><th>Last error</th></tr></thead><tbody id="rows"></tbody></table></div><p class="notice">Pool ACK is submission-to-response latency. Hashrate is unavailable: miners do not send hash telemetry. Recent history is kept in memory and resets on restart.</p></div>
+<div class="panel events"><h2>Session activity</h2><div id="events"><div class="empty">No events yet</div></div></div><footer id="summary"></footer></main>
+<script>
+const el=id=>document.getElementById(id),num=x=>Number(x).toLocaleString(),duration=x=>{x=Math.max(0,Math.floor(x));return x<60?x+'s':x<3600?Math.floor(x/60)+'m '+x%60+'s':Math.floor(x/3600)+'h '+Math.floor(x%3600/60)+'m'};
+let latest=null;
+function chart(id,series,colors,scaleId){const svg=el(id);svg.replaceChildren();const max=Math.max(1,...series.flat());series.forEach((values,index)=>{if(!values.length)return;const line=document.createElementNS('http://www.w3.org/2000/svg','polyline');line.setAttribute('points',values.map((v,i)=>`${i*600/Math.max(1,values.length-1)},${160-v/max*150}`).join(' '));line.setAttribute('fill','none');line.setAttribute('stroke',colors[index]);line.setAttribute('stroke-width','2');line.setAttribute('vector-effect','non-scaling-stroke');svg.append(line)});el(scaleId).textContent='Scale 0–'+Math.ceil(max)}
+function cell(row,text,cls){const td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;row.append(td);return td}
+function renderRows(){if(!latest)return;const query=el('search').value.toLowerCase(),rows=latest.sessions.filter(s=>(el('filter').value==='all'||s.status!=='closed')&&(s.worker+' '+s.id).toLowerCase().includes(query));el('rows').replaceChildren();el('sessionCount').textContent='· '+rows.length;for(const s of rows){const tr=document.createElement('tr');cell(tr,s.id);cell(tr,s.worker);const state=cell(tr,'');const badge=document.createElement('span');badge.className='state'+(s.status==='mining'?' live':'');badge.textContent=s.status;state.append(badge);cell(tr,duration((s.closed_at||latest.time)-s.connected_at));cell(tr,num(s.jobs));cell(tr,num(s.accepted),'green');cell(tr,num(s.rejected),'red');cell(tr,num(s.pending));cell(tr,s.latency_ms===null?'—':s.latency_ms+' ms');cell(tr,duration(latest.time-s.last_activity)+' ago');cell(tr,s.error||'—');el('rows').append(tr)}if(!rows.length){const tr=document.createElement('tr');const td=cell(tr,'No matching connections','empty');td.colSpan=11;el('rows').append(tr)}}
+function render(d){latest=d;el('health').className='pill';el('health').textContent='● Proxy running';el('upstream').textContent='Upstream '+d.upstream+' · Uptime '+duration(d.uptime_seconds);for(const key of ['active','authorized','pending'])el(key).textContent=num(d[key]);for(const key of ['accepted','rejected','errors'])el(key).textContent=num(d.totals[key]);el('updated').textContent='Updated '+new Date(d.time*1000).toLocaleTimeString();chart('connectionsChart',[d.history.map(x=>x.active)],['#ffac54'],'connectionsScale');const rate=key=>d.history.slice(1).map((x,i)=>Math.max(0,(x[key]-d.history[i][key])*60/Math.max(.001,x.time-d.history[i].time)));chart('sharesChart',[rate('accepted'),rate('rejected')],['#72dba1','#ff7c83'],'sharesScale');renderRows();el('events').replaceChildren();for(const e of d.events.slice(0,25)){const row=document.createElement('div');row.className='event';for(const [tag,value]of [['time',new Date(e.time*1000).toLocaleTimeString()],['code',e.session],['span',e.message]]){const node=document.createElement(tag);node.textContent=value;row.append(node)}el('events').append(row)}if(!d.events.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='No session activity yet';el('events').append(empty)}const total=d.totals.accepted+d.totals.rejected;el('summary').textContent='Since startup · '+num(d.totals.connections)+' connections · '+num(d.totals.jobs)+' jobs · '+num(d.totals.submitted)+' submitted · '+(total?(100*d.totals.accepted/total).toFixed(1)+'%':'—')+' acceptance'}
+async function poll(){try{const r=await fetch('/?status=1',{cache:'no-store',signal:AbortSignal.timeout(5000)});if(!r.ok)throw Error(r.status);render(await r.json())}catch(e){el('health').className='pill bad';el('health').textContent='● Telemetry disconnected';el('updated').textContent='Update failed · showing last snapshot'}finally{setTimeout(poll,2000)}}el('search').addEventListener('input',renderRows);el('filter').addEventListener('change',renderRows);poll();
+</script></body></html>'''
 
-async def gateway(ws, *, private, pool_host, pool_port):
+
+class Monitor:
+    def __init__(self, pool_host, pool_port):
+        self.started = time.monotonic()
+        self.upstream = f'{pool_host}:{pool_port}'
+        self.live = {}
+        self.closed = deque(maxlen=100)
+        self.events = deque(maxlen=80)
+        self.history = deque(maxlen=180)
+        self.total = dict(connections=0, accepted=0, rejected=0, submitted=0, jobs=0, errors=0)
+
+    def event(self, identity, message):
+        self.events.appendleft(dict(time=time.time(), session=identity, message=message))
+
+    def open(self):
+        identity = uuid.uuid4().hex[:12]
+        row = dict(id=identity, worker='—', status='handshake', connected_at=time.time(),
+                   last_activity=time.time(), accepted=0, rejected=0, submitted=0,
+                   jobs=0, pending=0, latency_ms=None, error=None)
+        self.live[identity] = row
+        self.total['connections'] += 1
+        self.event(identity, 'Connection opened')
+        return row
+
+    def count(self, row, field):
+        row[field] += 1
+        self.total[field] += 1
+        row['last_activity'] = time.time()
+
+    def close(self, row):
+        row['status'] = 'closed'
+        row['closed_at'] = time.time()
+        self.live.pop(row['id'], None)
+        self.closed.appendleft(row)
+        self.event(row['id'], 'Connection closed')
+
+    def snapshot(self):
+        authorized = sum(row['status'] in ('authorized', 'mining') for row in self.live.values())
+        return dict(status='running', upstream=self.upstream,
+                    uptime_seconds=int(time.monotonic() - self.started), time=time.time(),
+                    active=len(self.live), authorized=authorized,
+                    pending=sum(row['pending'] for row in self.live.values()),
+                    totals=dict(self.total), sessions=list(self.live.values()) + list(self.closed),
+                    history=list(self.history), events=list(self.events))
+
+    async def sample(self):
+        while True:
+            self.history.append(dict(time=time.time(), active=len(self.live),
+                                     accepted=self.total['accepted'], rejected=self.total['rejected']))
+            await asyncio.sleep(2)
+
+
+async def gateway(ws, *, pool_host, pool_port, monitor):
+    # A fresh ephemeral key belongs exclusively to this WebSocket connection.
+    private = X25519PrivateKey.generate()
+    row = monitor.open()
     writer = None
     tasks = []
     try:
@@ -140,10 +227,13 @@ async def gateway(ws, *, private, pool_host, pool_port):
         params = registration["params"]
         if not all(isinstance(params.get(k), str) and params[k] for k in ("wallet", "worker", "password")):
             raise ValueError("invalid registration")
+        row['worker'] = params['worker'][:128]
+        row['status'] = 'connecting pool'
         memo = params.get('memo')
         validate_destination(params['wallet'], memo)
         reader, writer = await asyncio.wait_for(asyncio.open_connection(
             pool_host, pool_port, limit=1024 * 1024), 15)
+        row['status'] = 'authorizing'
 
         async def pool_send(value):
             writer.write((json.dumps(value, separators=(",", ":")) + "\n").encode())
@@ -161,6 +251,7 @@ async def gateway(ws, *, private, pool_host, pool_port):
         early_jobs = []
         jobs = {}
         pending = {}
+        submitted_at = {}
         request_id = 100
         refill_job = None
         refill_request = None
@@ -170,6 +261,8 @@ async def gateway(ws, *, private, pool_host, pool_port):
             parsed = Job.parse(job)
             jobs[parsed.job_id] = parsed.params
             await send("worker.dataset", parsed.params)
+            row['status'] = 'mining'
+            monitor.count(row, 'jobs')
 
         async def maybe_refill():
             nonlocal request_id, refill_request, refill_job
@@ -185,6 +278,7 @@ async def gateway(ws, *, private, pool_host, pool_port):
                 if not line:
                     return
                 message = json.loads(line)
+                row['last_activity'] = time.time()
                 method, identity = message.get("method"), message.get("id")
                 if method == "job":
                     refill_job = None
@@ -196,6 +290,9 @@ async def gateway(ws, *, private, pool_host, pool_port):
                         early_jobs.append(message["params"])
                 elif identity == 1:
                     if str(message.get("status", "")).lower() != "ok" or message.get("error"):
+                        row['error'] = 'Pool login rejected'
+                        monitor.total['errors'] += 1
+                        monitor.event(row['id'], row['error'])
                         await send("worker.error", {"message": "BNT pool login rejected", "retry_after": 30})
                         return
                     result = message.get('result') or {}
@@ -203,10 +300,15 @@ async def gateway(ws, *, private, pool_host, pool_port):
                     payout_account = result.get('payout_account')
                     if memo is not None and (MEMO_CAPABILITY not in capabilities
                             or payout_account != account_id(params['wallet'], memo)):
+                        row['error'] = 'Pool did not acknowledge payout memo'
+                        monitor.total['errors'] += 1
+                        monitor.event(row['id'], row['error'])
                         await send('worker.error', {'message': 'pool did not acknowledge the payout memo',
                                                     'fatal': True})
                         return
                     authorized = True
+                    row['status'] = 'authorized'
+                    monitor.event(row['id'], 'Pool authorized')
                     await send("worker.ready", {"type": "bnt", "capabilities": sorted(capabilities),
                                                 'payout_account': payout_account})
                     for job in early_jobs:
@@ -222,10 +324,13 @@ async def gateway(ws, *, private, pool_host, pool_port):
                     await publish(message["result"])
                 elif identity in pending:
                     solution = pending.pop(identity)
+                    row['pending'] = len(pending)
+                    row['latency_ms'] = round((time.monotonic() - submitted_at.pop(identity)) * 1000, 1)
                     result = message.get("result") or {}
                     accepted = (result.get("accepted", str(message.get("status", "")).lower() == "ok")
                                 if isinstance(result, dict) else False)
                     accepted = bool(accepted) and not message.get("error")
+                    monitor.count(row, 'accepted' if accepted else 'rejected')
                     await send("worker.validation_result", {"job_id": solution["job_id"],
                                "nonce": solution["nonce"], "accepted": accepted,
                                "error": message.get("error") if not accepted else None})
@@ -235,6 +340,7 @@ async def gateway(ws, *, private, pool_host, pool_port):
             nonlocal request_id, refill_job
             async for frame in ws:
                 message = session.decrypt(frame)
+                row['last_activity'] = time.time()
                 method, value = message.get("method"), message.get("params", {})
                 if not authorized:
                     raise ValueError("worker not ready")
@@ -255,6 +361,9 @@ async def gateway(ws, *, private, pool_host, pool_port):
                             raise ValueError("invalid claimed hash")
                         solution["claimed_hash"] = value["hash"]
                     pending[request_id] = solution
+                    submitted_at[request_id] = time.monotonic()
+                    row['pending'] = len(pending)
+                    monitor.count(row, 'submitted')
                     await pool_send({"id": request_id, "method": "submit", "params": solution})
                 elif method == "worker.refill":
                     if "nonce_refill_v1" not in capabilities or value.get("job_id") not in jobs:
@@ -268,7 +377,12 @@ async def gateway(ws, *, private, pool_host, pool_port):
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
+    except ConnectionClosedOK:
+        pass
     except Exception as error:
+        row['error'] = str(error)[:240]
+        monitor.total['errors'] += 1
+        monitor.event(row['id'], row['error'])
         log.warning("Session ended: %s", error)
     finally:
         for task in tasks:
@@ -276,25 +390,53 @@ async def gateway(ws, *, private, pool_host, pool_port):
         await asyncio.gather(*tasks, return_exceptions=True)
         if writer is not None:
             writer.close()
-            await writer.wait_closed()
-        await ws.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), 5)
+            except (OSError, asyncio.TimeoutError):
+                pass
+        try:
+            await ws.close()
+        finally:
+            monitor.close(row)
 
 
 async def main():
-    private_hex = os.environ.get("PROXY_PRIVATE_KEY")
-    private = (X25519PrivateKey.from_private_bytes(bytes.fromhex(private_hex))
-               if private_hex else X25519PrivateKey.generate())
     host, port = os.environ.get("WS_HOST", "0.0.0.0"), int(os.environ.get("WS_PORT", "8000"))
     pool_host = os.environ.get("TCP_TARGET_HOST", "bntpool.com")
     pool_port = int(os.environ.get("TCP_TARGET_PORT", "3333"))
-    log.info("Proxy public key: %s", private.public_key().public_bytes_raw().hex())
+    monitor = Monitor(pool_host, pool_port)
 
     async def handler(ws):
-        await gateway(ws, private=private, pool_host=pool_host, pool_port=pool_port)
+        await gateway(ws, pool_host=pool_host, pool_port=pool_port, monitor=monitor)
 
-    async with serve(handler, host, port, max_size=1024 * 1024, ping_interval=20, ping_timeout=20):
-        log.info("ws://%s:%d -> stratum+tcp://%s:%d", host, port, pool_host, pool_port)
-        await asyncio.Future()
+    def process_request(connection, request):
+        url = urlsplit(request.path)
+        if url.path != '/':
+            return connection.respond(404, 'Not found\n')
+        if any(value.lower() == 'websocket' for value in request.headers.get_all('Upgrade')):
+            return None
+        if parse_qs(url.query).get('status') == ['1']:
+            response = connection.respond(200, json.dumps(monitor.snapshot(), ensure_ascii=True))
+            content_type = 'application/json; charset=utf-8'
+        else:
+            response = connection.respond(200, DASHBOARD)
+            content_type = 'text/html; charset=utf-8'
+        # websockets.Headers appends on assignment; replace the default text/plain.
+        del response.headers['Content-Type']
+        response.headers['Content-Type'] = content_type
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        return response
+
+    sampler = asyncio.create_task(monitor.sample())
+    try:
+        async with serve(handler, host, port, process_request=process_request,
+                         max_size=1024 * 1024, ping_interval=20, ping_timeout=20):
+            log.info('HTTP dashboard + WebSocket on / at %s:%d; upstream %s', host, port, monitor.upstream)
+            await asyncio.Future()
+    finally:
+        sampler.cancel()
+        await asyncio.gather(sampler, return_exceptions=True)
 
 
 if __name__ == "__main__":
