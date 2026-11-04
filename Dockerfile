@@ -9,17 +9,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY proxy/requirements.txt /app/proxy/requirements.txt
-RUN python -m pip install --no-cache-dir --only-binary=:all: -r /app/proxy/requirements.txt \
+RUN python -m pip install --no-cache-dir --only-binary=:all: cryptography==50.0.2 websockets==16.1.1 \
     && useradd --create-home --uid 10001 proxy
 
-# Only Python helpers are imported; the gateway never starts a hashing engine.
-COPY src/ /app/bnt_cpu_miner/
-COPY proxy/server.py /app/proxy/server.py
-COPY LICENSE /app/LICENSE
+COPY server.py /app/server.py
 
-ENV PYTHONPATH=/app
 USER proxy
 EXPOSE 8000
 
-CMD ["python", "/app/proxy/server.py"]
+CMD ["python", "/app/server.py"]
