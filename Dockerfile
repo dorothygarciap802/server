@@ -9,12 +9,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN python -m pip install --no-cache-dir --only-binary=:all: cryptography==50.0.2 websockets==16.1.1 \
-    && useradd --create-home --uid 10001 proxy
+RUN python -m pip install --no-cache-dir --only-binary=:all: cryptography==50.0.2 websockets==16.1.1
 
 COPY server.py /app/server.py
 
-USER proxy
+# Numeric IDs avoid collisions with accounts already present in the base image.
+USER 10001:10001
 EXPOSE 8000
 
 CMD ["python", "/app/server.py"]
