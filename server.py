@@ -1,18 +1,119 @@
 #!/usr/bin/env python3
 """BNT gateway: existing proxy E2E wire format, native Blocknet pool protocol.
-Install bnt-cpu-miner first. Python preserves all unsigned 64-bit nonce values.
+Standalone server. Python preserves all unsigned 64-bit nonce values.
 """
 import asyncio
+from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import os
+import unicodedata
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from websockets.asyncio.server import serve
 
-from bnt_cpu_miner.crypto import Session
-from bnt_cpu_miner.miner import Job, integer
-from bnt_cpu_miner.payout import MEMO_CAPABILITY, account_id, validate_destination
+# Keep this file standalone; these helpers match the miner's wire protocol.
+MEMO_CAPABILITY = 'payout_memo_v1'
+KNOWN_EXCHANGE = 'ZJZqGfDPCVg78CRH5Z33CtHafg911Dp5Bauf1Dnxg5jgXx7Whqsvqka96FCV8W6QZXNDKzJefkFU6bwDEGBewqPrTWjij'
+MAX_NONCE = 2**64 - 1
+
+
+def validate_memo(memo):
+    if not isinstance(memo, str) or not 1 <= len(memo.encode('utf-8')) <= 124:
+        raise ValueError('memo must contain 1..124 UTF-8 bytes')
+    if any(unicodedata.category(character) == 'Cc' for character in memo):
+        raise ValueError('memo must not contain control characters')
+    return memo
+
+
+def account_id(wallet, memo=None):
+    wallet = wallet.strip()
+    if memo is None:
+        return wallet
+    validate_memo(memo)
+    address = wallet.encode('utf-8')
+    digest = hashlib.sha3_256(b'blocknet_pool_payout_memo_v1\0'
+                             + len(address).to_bytes(8, 'big') + address + memo.encode('utf-8'))
+    return 'memo:' + digest.hexdigest()
+
+
+def validate_destination(wallet, memo=None):
+    if not isinstance(wallet, str) or not wallet.strip():
+        raise ValueError('wallet is required')
+    if memo is not None:
+        validate_memo(memo)
+    if wallet.strip() == KNOWN_EXCHANGE and memo is None:
+        raise ValueError('this exchange address requires a payout memo')
+
+
+def integer(value, field):
+    if type(value) is not int or not 0 <= value <= MAX_NONCE:
+        raise ValueError(f'{field} must be an unsigned 64-bit integer')
+    return value
+
+
+@dataclass(frozen=True)
+class Job:
+    params: dict
+
+    @property
+    def job_id(self):
+        return self.params['job_id']
+
+    @classmethod
+    def parse(cls, params):
+        if not isinstance(params, dict):
+            raise ValueError('BNT jobs require an object, not a PRL dataset/array')
+        if not isinstance(params.get('job_id'), str) or not params['job_id']:
+            raise ValueError('invalid job_id')
+        header = bytes.fromhex(params['header_base'])
+        target = bytes.fromhex(params['target'])
+        height = integer(params['height'], 'height')
+        start = integer(params['nonce_start'], 'nonce_start')
+        end = integer(params['nonce_end'], 'nonce_end')
+        if not 8 <= len(header) <= 4096 or len(target) != 32 or end < start:
+            raise ValueError('invalid BNT header, target or nonce range')
+        if height >= 103_680:
+            raise ValueError('Faraday PoW parameters are provisional; this build refuses that height')
+        return cls(dict(params))
+
+
+class Session:
+    def __init__(self, secret, *, server=False):
+        def key(direction):
+            return AESGCM(HKDF(algorithm=hashes.SHA256(), length=32,
+                              salt=b'csd-pool-e2e-v1',
+                              info=b'aes-256-gcm-key-' + direction).derive(secret))
+        self.tx = key(b's2c' if server else b'c2s')
+        self.rx = key(b'c2s' if server else b's2c')
+        self.counter = 0
+        self.last_rx = 0
+
+    def encrypt(self, message):
+        self.counter += 1
+        nonce = b'CSD!' + self.counter.to_bytes(8, 'big')
+        plain = json.dumps(message, separators=(',', ':')).encode()
+        return (b'\x0c' + nonce + self.tx.encrypt(nonce, plain, None)).hex()
+
+    def decrypt(self, text):
+        if not isinstance(text, str):
+            raise ValueError('expected hexadecimal text frame')
+        wire = bytes.fromhex(text)
+        if len(wire) < 29 or wire[0] != 12 or wire[1:5] != b'CSD!':
+            raise ValueError('invalid E2E frame')
+        counter = int.from_bytes(wire[5:13], 'big')
+        if counter <= self.last_rx:
+            raise ValueError('replayed E2E frame')
+        plain = self.rx.decrypt(wire[1:13], wire[13:], None)
+        self.last_rx = counter
+        message = json.loads(plain)
+        if not isinstance(message, dict):
+            raise ValueError('expected JSON object')
+        return message
 
 log = logging.getLogger("bnt-proxy")
 
