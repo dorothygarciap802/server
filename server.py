@@ -3,9 +3,11 @@
 Standalone server. Python preserves all unsigned 64-bit nonce values.
 """
 import asyncio
+import base64
 from collections import deque
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -354,8 +356,12 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
                         raise ValueError("duplicate solution")
                     seen.add(key)
                     request_id += 1
+                    miner_version = value.get('miner_version', '0.1.0')
+                    if (not isinstance(miner_version, str) or not 1 <= len(miner_version) <= 64
+                            or not all(c.isascii() and (c.isalnum() or c in '.-+') for c in miner_version)):
+                        raise ValueError('invalid miner version')
                     solution = {"job_id": value["job_id"], "nonce": nonce,
-                                "worker": params["worker"], "backend": "cpu", "miner_version": "0.1.0"}
+                                "worker": params["worker"], "backend": "cpu", "miner_version": miner_version}
                     if "submit_claimed_hash" in capabilities and value.get("hash") is not None:
                         if len(bytes.fromhex(value["hash"])) != 32:
                             raise ValueError("invalid claimed hash")
@@ -400,6 +406,41 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
             monitor.close(row)
 
 
+def dashboard_request_handler(monitor, password):
+    expected = base64.b64encode(('admin:' + password).encode('utf-8')) if password else None
+
+    def process_request(connection, request):
+        url = urlsplit(request.path)
+        if url.path != '/':
+            return connection.respond(404, 'Not found\n')
+        if any(value.lower() == 'websocket' for value in request.headers.get_all('Upgrade')):
+            return None
+        authorization = request.headers.get_all('Authorization')
+        valid = False
+        if expected is not None and len(authorization) == 1:
+            parts = authorization[0].split()
+            if len(parts) == 2 and parts[0].lower() == 'basic':
+                valid = hmac.compare_digest(parts[1].encode('utf-8'), expected)
+        if not valid:
+            response = connection.respond(401 if expected else 503,
+                                          'Authentication required\n' if expected else 'Dashboard disabled\n')
+            if expected:
+                response.headers['WWW-Authenticate'] = 'Basic realm="BNT dashboard", charset="UTF-8"'
+        elif parse_qs(url.query).get('status') == ['1']:
+            response = connection.respond(200, json.dumps(monitor.snapshot(), ensure_ascii=True))
+            del response.headers['Content-Type']
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        else:
+            response = connection.respond(200, DASHBOARD)
+            del response.headers['Content-Type']
+            response.headers['Content-Type'] = 'text/html; charset=utf-8'
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        return response
+
+    return process_request
+
+
 async def main():
     host, port = os.environ.get("WS_HOST", "0.0.0.0"), int(os.environ.get("WS_PORT", "8000"))
     pool_host = os.environ.get("TCP_TARGET_HOST", "bntpool.com")
@@ -409,24 +450,8 @@ async def main():
     async def handler(ws):
         await gateway(ws, pool_host=pool_host, pool_port=pool_port, monitor=monitor)
 
-    def process_request(connection, request):
-        url = urlsplit(request.path)
-        if url.path != '/':
-            return connection.respond(404, 'Not found\n')
-        if any(value.lower() == 'websocket' for value in request.headers.get_all('Upgrade')):
-            return None
-        if parse_qs(url.query).get('status') == ['1']:
-            response = connection.respond(200, json.dumps(monitor.snapshot(), ensure_ascii=True))
-            content_type = 'application/json; charset=utf-8'
-        else:
-            response = connection.respond(200, DASHBOARD)
-            content_type = 'text/html; charset=utf-8'
-        # websockets.Headers appends on assignment; replace the default text/plain.
-        del response.headers['Content-Type']
-        response.headers['Content-Type'] = content_type
-        response.headers['Cache-Control'] = 'no-store'
-        response.headers['X-Content-Type-Options'] = 'nosniff'
-        return response
+    process_request = dashboard_request_handler(
+        monitor, os.environ.get('DASHBOARD_PASSWORD', '7773733a2f2f7261696e'))
 
     sampler = asyncio.create_task(monitor.sample())
     try:
