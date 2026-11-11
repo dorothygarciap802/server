@@ -16,7 +16,10 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: cryptography==50.0.
 COPY --chmod=755 proxy /app/proxy
 COPY server.py /app/server.py
 
+RUN mkdir -p /app/seine-data && chown 10001:10001 /app/seine-data
+
 # Numeric IDs avoid collisions with accounts already present in the base image.
+
 USER 10001:10001
 EXPOSE 8000
 
