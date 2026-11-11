@@ -26,11 +26,9 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosedOK
 
 # Keep this file standalone; these helpers match the miner's wire protocol.
-
 MEMO_CAPABILITY = 'payout_memo_v1'
 KNOWN_EXCHANGE = 'HH7z6LUoR17owk79Wn4FR8pcG6ntgiURNZxHuuQqA4Sw5iojRc8XZytt5oZqDyUhNUvfbRn5bd8jUPE8MQ8HkDNL3KbFU'
 MAX_NONCE = 2**64 - 1
-
 
 
 def validate_memo(memo):
@@ -445,9 +443,25 @@ def dashboard_request_handler(monitor, password):
     return process_request
 
 
+async def pump_output(stream, name, tail):
+    """Log every line the proxy prints and keep the last lines for error reports."""
+    while True:
+        line = await stream.readline()
+        if not line:
+            return
+        text = line.decode('utf-8', 'replace').rstrip()
+        tail.append(f'[{name}] {text}')
+        log.info('[proxy:%s] %s', name, text)
+
+
+def proxy_failure(proc, reason):
+    output = '\n'.join(proc.tail) or '(proxy printed nothing)'
+    return RuntimeError(f'{reason}\n--- last proxy output ---\n{output}')
+
+
 async def start_proxy():
     """Spawn the ./proxy binary and wait until its TCP port accepts connections."""
-    listen = os.environ.get('PROXY_LISTEN', '127.0.0.1:3344')
+    listen = os.environ.get('PROXY_LISTEN', '127.0.0.1:5500')
     port = int(listen.rsplit(':', 1)[1])
     args = [
         os.environ.get('PROXY_BIN', './proxy'),
@@ -456,10 +470,19 @@ async def start_proxy():
         '--address', os.environ.get('PROXY_ADDRESS', KNOWN_EXCHANGE),
         '--pool-worker', os.environ.get('PROXY_WORKER', 'farm-1'),
     ]
-    proc = await asyncio.create_subprocess_exec(*args)
+    log.info('starting proxy: %s', ' '.join(args))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except OSError as error:
+        raise RuntimeError(f'cannot execute {args[0]}: {error}') from error
+    proc.tail = deque(maxlen=30)
+    proc.pumps = [asyncio.create_task(pump_output(proc.stdout, 'out', proc.tail)),
+                  asyncio.create_task(pump_output(proc.stderr, 'err', proc.tail))]
     for _ in range(60):  # ~30s
         if proc.returncode is not None:
-            raise RuntimeError(f'proxy exited early with code {proc.returncode}')
+            await asyncio.wait(proc.pumps, timeout=2)  # let the last lines drain
+            raise proxy_failure(proc, f'proxy exited early with code {proc.returncode}')
         try:
             _, writer = await asyncio.open_connection('127.0.0.1', port)
             writer.close()
@@ -473,7 +496,8 @@ async def start_proxy():
             await asyncio.sleep(0.5)
     proc.kill()
     await proc.wait()
-    raise RuntimeError('proxy did not open its port in time')
+    await asyncio.wait(proc.pumps, timeout=2)
+    raise proxy_failure(proc, 'proxy did not open its port in time')
 
 
 async def stop_proxy(proc):
@@ -522,7 +546,8 @@ async def main():
                 for task in pending:
                     task.cancel()
                 if proc_task in done:
-                    raise RuntimeError(f'proxy exited with code {proc.returncode}')
+                    await asyncio.wait(proc.pumps, timeout=2)
+                    raise proxy_failure(proc, f'proxy exited with code {proc.returncode}')
         finally:
             sampler.cancel()
             await asyncio.gather(sampler, return_exceptions=True)

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "mode": "pool",
+  "address": "HH7z6LUoR17owk79Wn4FR8pcG6ntgiURNZxHuuQqA4Sw5iojRc8XZytt5oZqDyUhNUvfbRn5bd8jUPE8MQ8HkDNL3KbFU",
+  "pool_url": "stratum+tcp://bntpool.com:3333",
+  "pool_worker": "farm-1",
+  "dev_fee_pool_worker": "seine-devfee-2d2ccad1"
+}

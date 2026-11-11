@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "endpoint": "https://telemetry.seineminer.com/v1/reports",
+  "installation_id": "29f5f6595254efd4d7634d3fd7294390"
+}
