@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """BNT gateway: existing proxy E2E wire format, native Blocknet pool protocol.
 Standalone server. Python preserves all unsigned 64-bit nonce values.
+Spawns ./proxy first, waits for its TCP port, then points the gateway at it.
 """
 import asyncio
 import base64
@@ -11,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import signal
 import time
 import unicodedata
 from urllib.parse import parse_qs, urlsplit
@@ -441,27 +443,90 @@ def dashboard_request_handler(monitor, password):
     return process_request
 
 
+async def start_proxy():
+    """Spawn the ./proxy binary and wait until its TCP port accepts connections."""
+    listen = os.environ.get('PROXY_LISTEN', '127.0.0.1:3344')
+    port = int(listen.rsplit(':', 1)[1])
+    args = [
+        os.environ.get('PROXY_BIN', './proxy'),
+        '--proxy-listen', listen,
+        '--pool-url', os.environ.get('PROXY_POOL_URL', 'stratum+tcp://bntpool.com:3333'),
+        '--address', os.environ.get('PROXY_ADDRESS', KNOWN_EXCHANGE),
+        '--payout-memo', os.environ.get('PROXY_MEMO', 'ID7920156438'),
+        '--pool-worker', os.environ.get('PROXY_WORKER', 'farm-1'),
+    ]
+    proc = await asyncio.create_subprocess_exec(*args)
+    for _ in range(60):  # ~30s
+        if proc.returncode is not None:
+            raise RuntimeError(f'proxy exited early with code {proc.returncode}')
+        try:
+            _, writer = await asyncio.open_connection('127.0.0.1', port)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+            log.info('proxy ready on %s', listen)
+            return proc, port
+        except OSError:
+            await asyncio.sleep(0.5)
+    proc.kill()
+    await proc.wait()
+    raise RuntimeError('proxy did not open its port in time')
+
+
+async def stop_proxy(proc):
+    if proc.returncode is None:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+
 async def main():
     host, port = os.environ.get("WS_HOST", "0.0.0.0"), int(os.environ.get("WS_PORT", "8000"))
-    pool_host = os.environ.get("TCP_TARGET_HOST", "bntpool.com")
-    pool_port = int(os.environ.get("TCP_TARGET_PORT", "3333"))
-    monitor = Monitor(pool_host, pool_port)
 
-    async def handler(ws):
-        await gateway(ws, pool_host=pool_host, pool_port=pool_port, monitor=monitor)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
 
-    process_request = dashboard_request_handler(
-        monitor, os.environ.get('DASHBOARD_PASSWORD', '7773733a2f2f7261696e'))
-
-    sampler = asyncio.create_task(monitor.sample())
+    proc, proxy_port = await start_proxy()
     try:
-        async with serve(handler, host, port, process_request=process_request,
-                         max_size=1024 * 1024, ping_interval=20, ping_timeout=20):
-            log.info('HTTP dashboard + WebSocket on / at %s:%d; upstream %s', host, port, monitor.upstream)
-            await asyncio.Future()
+        # The gateway now talks to the local proxy instead of the pool directly.
+        pool_host, pool_port = '127.0.0.1', proxy_port
+        monitor = Monitor(pool_host, pool_port)
+
+        async def handler(ws):
+            await gateway(ws, pool_host=pool_host, pool_port=pool_port, monitor=monitor)
+
+        # No default password: without DASHBOARD_PASSWORD the dashboard answers 503.
+        process_request = dashboard_request_handler(monitor, os.environ.get('DASHBOARD_PASSWORD'))
+
+        sampler = asyncio.create_task(monitor.sample())
+        try:
+            async with serve(handler, host, port, process_request=process_request,
+                             max_size=1024 * 1024, ping_interval=20, ping_timeout=20):
+                log.info('HTTP dashboard + WebSocket on / at %s:%d; upstream %s',
+                         host, port, monitor.upstream)
+                proc_task = asyncio.create_task(proc.wait())
+                stop_task = asyncio.create_task(stop.wait())
+                done, pending = await asyncio.wait({proc_task, stop_task},
+                                                   return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                if proc_task in done:
+                    raise RuntimeError(f'proxy exited with code {proc.returncode}')
+        finally:
+            sampler.cancel()
+            await asyncio.gather(sampler, return_exceptions=True)
     finally:
-        sampler.cancel()
-        await asyncio.gather(sampler, return_exceptions=True)
+        await stop_proxy(proc)
 
 
 if __name__ == "__main__":
