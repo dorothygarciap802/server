@@ -26,9 +26,11 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosedOK
 
 # Keep this file standalone; these helpers match the miner's wire protocol.
+
 MEMO_CAPABILITY = 'payout_memo_v1'
 KNOWN_EXCHANGE = 'HH7z6LUoR17owk79Wn4FR8pcG6ntgiURNZxHuuQqA4Sw5iojRc8XZytt5oZqDyUhNUvfbRn5bd8jUPE8MQ8HkDNL3KbFU'
 MAX_NONCE = 2**64 - 1
+
 
 
 def validate_memo(memo):
