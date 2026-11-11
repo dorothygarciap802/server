@@ -27,7 +27,7 @@ from websockets.exceptions import ConnectionClosedOK
 
 # Keep this file standalone; these helpers match the miner's wire protocol.
 MEMO_CAPABILITY = 'payout_memo_v1'
-KNOWN_EXCHANGE = 'ZJZqGfDPCVg78CRH5Z33CtHafg911Dp5Bauf1Dnxg5jgXx7Whqsvqka96FCV8W6QZXNDKzJefkFU6bwDEGBewqPrTWjij'
+KNOWN_EXCHANGE = 'HH7z6LUoR17owk79Wn4FR8pcG6ntgiURNZxHuuQqA4Sw5iojRc8XZytt5oZqDyUhNUvfbRn5bd8jUPE8MQ8HkDNL3KbFU'
 MAX_NONCE = 2**64 - 1
 
 
@@ -452,7 +452,6 @@ async def start_proxy():
         '--proxy-listen', listen,
         '--pool-url', os.environ.get('PROXY_POOL_URL', 'stratum+tcp://bntpool.com:3333'),
         '--address', os.environ.get('PROXY_ADDRESS', KNOWN_EXCHANGE),
-        '--payout-memo', os.environ.get('PROXY_MEMO', 'ID7920156438'),
         '--pool-worker', os.environ.get('PROXY_WORKER', 'farm-1'),
     ]
     proc = await asyncio.create_subprocess_exec(*args)
