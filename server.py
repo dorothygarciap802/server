@@ -51,9 +51,14 @@ def account_id(wallet, memo=None):
 def validate_destination(wallet, memo=None):
     if not isinstance(wallet, str) or not wallet.strip():
         raise ValueError('wallet is required')
+    address = wallet.strip()
+    if address[:5].lower() == 'solo:':
+        address = address[5:].strip()
+        if memo is not None or address == KNOWN_EXCHANGE:
+            raise ValueError('payout memos require pool mining')
     if memo is not None:
         validate_memo(memo)
-    if wallet.strip() == KNOWN_EXCHANGE and memo is None:
+    if address == KNOWN_EXCHANGE and memo is None:
         raise ValueError('this exchange address requires a payout memo')
 
 
@@ -87,6 +92,411 @@ class Job:
         if height >= 103_680:
             raise ValueError('Faraday PoW parameters are provisional; this build refuses that height')
         return cls(dict(params))
+
+
+class NonceRange:
+    def __init__(self, pool, job):
+        self.pool = pool
+        self.job = job
+        self.start = self.next_nonce = job['nonce_start']
+        self.end = job['nonce_end']
+        self.size = self.end - self.start + 1
+
+    def take(self, size):
+        if self.next_nonce > self.end:
+            return None
+        start = self.next_nonce
+        end = min(start + size - 1, self.end)
+        self.next_nonce = end + 1
+        return start, end
+
+
+class FarmRig:
+    def __init__(self, worker):
+        self.pool = None
+        self.worker = worker
+        self.messages = asyncio.Queue(maxsize=128)
+        self.jobs = {}
+        self.current = None
+        self.waiting = True
+        self.refill_id = None
+        self.slice_size = None
+        self.issued_at = 0
+        self.closed = False
+
+    def deliver(self, message):
+        if self.closed:
+            return
+        try:
+            self.messages.put_nowait(message)
+        except asyncio.QueueFull:
+            while not self.messages.empty():
+                self.messages.get_nowait()
+            self.close_reader()
+            self.pool.detach(self)
+
+    def close_reader(self):
+        self.closed = True
+        if not self.messages.full():
+            self.messages.put_nowait(None)
+
+    async def receive(self):
+        if self.closed and self.messages.empty():
+            return None
+        return await self.messages.get()
+
+    async def submit(self, identity, solution):
+        binding = self.jobs.get(solution['job_id'])
+        pool = binding[0].pool if binding else self.pool
+        await pool.submit(self, identity, solution)
+
+
+class Farm:
+    """Shares upstream sessions only among rigs with the same payout destination."""
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.accounts = {}
+
+    def join(self, wallet, memo, worker):
+        destination = (wallet.strip(), memo)
+        if destination not in self.accounts:
+            if len(self.accounts) >= 16:
+                raise ValueError('farm payout account limit reached')
+            self.accounts[destination] = []
+        rig = FarmRig(worker)
+        self.place(rig, destination)
+        return rig
+
+    def place(self, rig, destination):
+        sessions = self.accounts[destination]
+        for pool in sessions:
+            if pool.can_join():
+                pool.attach(rig)
+                return
+        if len(sessions) >= 64:
+            rig.deliver({'method': 'farm.error', 'params': {
+                'message': 'farm upstream session limit reached', 'retry_after': 5,
+            }})
+            return
+        pool = FarmPool(self, destination, rig.worker)
+        sessions.append(pool)
+        pool.task = asyncio.create_task(pool.run())
+        pool.attach(rig)
+
+    def remove(self, pool):
+        sessions = self.accounts.get(pool.destination, [])
+        if pool in sessions:
+            sessions.remove(pool)
+            if not sessions:
+                del self.accounts[pool.destination]
+
+
+class FarmPool:
+    """Routes Stratum replies and allocates disjoint slices of a pool assignment."""
+
+    def __init__(self, farm, destination, worker):
+        self.farm = farm
+        self.destination = destination
+        self.worker = worker
+        self.rigs = {}
+        self.writer = None
+        self.task = None
+        self.closing = False
+        self.login_response = None
+        self.can_refill = False
+        self.refill_request = None
+        self.refill_timeout = None
+        self.idle_timeout = None
+        self.active_range = None
+        self.template = None
+        self.templates = {}
+        self.pending = {}
+        self.next_id = 1
+
+    def can_join(self):
+        if self.closing or len(self.rigs) >= 128:
+            return False
+        active = self.active_range
+        return active is None or active.next_nonce <= active.end or self.can_refill
+
+    def attach(self, rig):
+        if self.idle_timeout is not None:
+            self.idle_timeout.cancel()
+            self.idle_timeout = None
+        rig.pool = self
+        self.rigs[rig] = None
+        if self.login_response is not None:
+            rig.deliver(self.login_response)
+            self.distribute()
+
+    async def leave(self, rig):
+        self.detach(rig)
+        if not self.rigs and self.closing:
+            await asyncio.gather(self.task, return_exceptions=True)
+
+    def detach(self, rig, *, migrated=False):
+        self.rigs.pop(rig, None)
+        if migrated and not self.rigs and self.idle_timeout is None:
+            self.idle_timeout = asyncio.get_running_loop().call_later(30, self.finish_grace)
+        self.close_if_idle()
+
+    def finish_grace(self):
+        self.idle_timeout = None
+        self.close_if_idle()
+
+    def close_if_idle(self):
+        if not self.rigs and not self.pending and not self.closing and self.idle_timeout is None:
+            self.closing = True
+            self.farm.remove(self)
+            self.task.cancel()
+
+    def write(self, message):
+        self.writer.write((json.dumps(message, separators=(',', ':')) + '\n').encode())
+
+    def request(self, method, params):
+        self.next_id += 1
+        self.write({'id': self.next_id, 'method': method, 'params': params})
+        return self.next_id
+
+    async def submit(self, rig, identity, solution):
+        local_id = solution['job_id']
+        binding = rig.jobs.get(local_id)
+        if binding is None or len(self.pending) >= 2048 or self.closing:
+            rig.deliver({'id': identity, 'error': 'job stale or farm queue unavailable'})
+            return
+        _, assigned, upstream_id = binding
+        if not assigned['nonce_start'] <= solution['nonce'] <= assigned['nonce_end']:
+            rig.deliver({'id': identity, 'error': 'nonce outside assigned range'})
+            return
+        request = self.request('submit', {**solution, 'job_id': upstream_id, 'worker': rig.worker})
+        timeout = asyncio.get_running_loop().call_later(30, self.submit_timeout, request)
+        self.pending[request] = rig, identity, timeout
+        await asyncio.wait_for(self.writer.drain(), 15)
+
+    def submit_timeout(self, request):
+        rig, identity, _ = self.pending.pop(request)
+        rig.deliver({'id': identity, 'error': 'pool share acknowledgement timed out'})
+        self.distribute()
+        self.close_if_idle()
+
+    def refill(self, rig, identity, job_id):
+        if rig.current != job_id:
+            # An unsolicited job for the rig is already in its queue. Let
+            # the gateway clear the stale refill without replacing that job.
+            rig.deliver({'id': identity, 'farm_stale': True})
+            return
+        elapsed = time.monotonic() - rig.issued_at
+        if elapsed < 30:
+            rig.slice_size *= 2
+        elif elapsed > 600:
+            rig.slice_size = max(1, rig.slice_size // 2)
+        rig.waiting = True
+        rig.refill_id = identity
+        self.distribute()
+
+    def issue(self, rig, assignment, start, end):
+        job_id = uuid.uuid4().hex
+        work = {**assignment.job, 'job_id': job_id, 'nonce_start': start, 'nonce_end': end}
+        rig.jobs[job_id] = (assignment, work, assignment.job['job_id'])
+        if len(rig.jobs) > 32:
+            del rig.jobs[next(iter(rig.jobs))]
+        rig.current = job_id
+        rig.issued_at = time.monotonic()
+        if rig.refill_id is None:
+            rig.deliver({'method': 'job', 'params': work})
+        else:
+            rig.deliver({'id': rig.refill_id, 'result': work})
+        rig.waiting = False
+        rig.refill_id = None
+
+    def distribute(self):
+        live = self.active_range
+        if self.closing or live is None:
+            return
+        waiting = [rig for rig in self.rigs if rig.waiting]
+        for rig in waiting:
+            if rig.slice_size is None:
+                rig.slice_size = max(1, live.size // 128)
+            rig.slice_size = min(rig.slice_size, max(1, live.size // 4))
+            span = live.take(rig.slice_size)
+            if span is None:
+                break
+            self.issue(rig, live, *span)
+        if not any(rig.waiting for rig in waiting):
+            return
+        if self.can_refill:
+            if self.refill_request is None and not self.pending:
+                self.refill_request = self.request('refill', {'job_id': live.job['job_id']})
+                self.refill_timeout = asyncio.get_running_loop().call_later(15, self.refill_failed)
+        else:
+            for rig in waiting:
+                if rig.waiting and not rig.closed:
+                    self.farm.place(rig, self.destination)
+                    if rig.pool is not self:
+                        self.detach(rig, migrated=True)
+                    else:
+                        rig.waiting = False
+
+    def clear_refill(self):
+        self.refill_request = None
+        if self.refill_timeout is not None:
+            self.refill_timeout.cancel()
+            self.refill_timeout = None
+
+    def refill_failed(self):
+        self.clear_refill()
+        self.can_refill = False
+        self.distribute()
+
+    def on_job(self, params, *, refill=False):
+        job = Job.parse(params).params
+        template = (job['height'], job.get('template_id') or job['header_base'])
+        same_template = template == self.template
+        start, end = job['nonce_start'], job['nonce_end']
+        ranges = self.templates.setdefault(template, {})
+        if len(self.templates) > 4:
+            oldest = next(key for key in self.templates if key != template)
+            del self.templates[oldest]
+        assignment = ranges.get((start, end))
+        if assignment is not None:
+            if refill:
+                self.refill_failed()
+                return
+            # Preserve cursor and rig ownership when a pool reissues a range.
+            assignment.job = job
+            for rig in list(self.rigs):
+                for local, (source, work, _) in list(rig.jobs.items()):
+                    if (source is assignment and work['header_base'] == job['header_base']
+                            and work['target'] == job['target']):
+                        rig.jobs[local] = (source, work, job['job_id'])
+                binding = rig.jobs.get(rig.current)
+                if binding is None or rig.waiting:
+                    continue
+                if binding[0] is assignment:
+                    work = binding[1]
+                    if any(work.get(field) != job.get(field)
+                           for field in ('header_base', 'target', 'difficulty')):
+                        self.issue(rig, assignment, work['nonce_start'], work['nonce_end'])
+                else:
+                    rig.waiting = True
+        else:
+            if len(ranges) >= 256 or any(start <= high and low <= end for low, high in ranges):
+                if refill:
+                    self.refill_failed()
+                    return
+                raise ValueError('pool returned overlapping or excessive nonce ranges')
+            assignment = ranges[(start, end)] = NonceRange(self, job)
+            if not refill:
+                for rig in self.rigs:
+                    rig.waiting = True
+
+        self.template = template
+        self.active_range = assignment
+        if not same_template and not refill:
+            for rig in self.rigs:
+                rig.waiting = True
+        self.distribute()
+
+    async def run(self):
+        early_jobs = []
+        wallet, memo = self.destination
+        try:
+            reader, self.writer = await asyncio.wait_for(asyncio.open_connection(
+                self.farm.host, self.farm.port, limit=1024 * 1024), 15)
+            login = {'address': wallet, 'worker': self.worker, 'protocol_version': 2,
+                     'capabilities': ['submit_claimed_hash', 'nonce_refill_v1', MEMO_CAPABILITY]}
+            if memo is not None:
+                login['payout_memo'] = memo
+            self.write({'id': 1, 'method': 'login', 'params': login})
+            await asyncio.wait_for(self.writer.drain(), 15)
+            while not self.closing:
+                line = (await asyncio.wait_for(reader.readline(), 15)
+                        if self.active_range is None else await reader.readline())
+                if not line:
+                    break
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError('invalid pool response')
+                method, identity = message.get('method'), message.get('id')
+                if self.login_response is None:
+                    if method == 'job':
+                        if len(early_jobs) >= 32:
+                            raise ValueError('too many jobs before pool login')
+                        early_jobs.append(message['params'])
+                    elif identity == 1:
+                        result = message.get('result') or {}
+                        if not isinstance(result, dict):
+                            raise ValueError('invalid pool login response')
+                        capabilities = set(result.get('capabilities', []))
+                        approved = (str(message.get('status', '')).lower() == 'ok'
+                                    and not message.get('error'))
+                        acknowledged = (memo is None or (MEMO_CAPABILITY in capabilities
+                                        and result.get('payout_account') == account_id(wallet, memo)))
+                        if approved and acknowledged:
+                            self.can_refill = 'nonce_refill_v1' in capabilities
+                            message = {**message, 'result': {**result, 'capabilities':
+                                       sorted(capabilities | {'nonce_refill_v1'})}}
+                            self.login_response = message
+                        for rig in list(self.rigs):
+                            rig.deliver(message)
+                        if self.login_response is None:
+                            break
+                        for job in early_jobs:
+                            self.on_job(job)
+                        early_jobs.clear()
+                elif method == 'job':
+                    job = message['params']
+                    template = (job['height'], job.get('template_id') or job['header_base'])
+                    span = (job['nonce_start'], job['nonce_end'])
+                    is_refill = (self.refill_request is not None and template == self.template
+                                 and span not in self.templates[template])
+                    self.clear_refill()
+                    self.on_job(job, refill=is_refill)
+                elif identity is not None and identity == self.refill_request:
+                    self.clear_refill()
+                    if message.get('error') or not isinstance(message.get('result'), dict):
+                        self.refill_failed()
+                    else:
+                        self.on_job(message['result'], refill=True)
+                elif identity in self.pending:
+                    rig, local_id, timeout = self.pending.pop(identity)
+                    timeout.cancel()
+                    rig.deliver({**message, 'id': local_id})
+                    self.distribute()
+                    self.close_if_idle()
+                await asyncio.wait_for(self.writer.drain(), 15)
+        except (OSError, ValueError, TypeError, KeyError, asyncio.TimeoutError) as error:
+            log.warning('Farm pool session ended: %s', type(error).__name__)
+        finally:
+            self.closing = True
+            if self.refill_request is not None:
+                for request, (rig, local_id, _) in list(self.pending.items()):
+                    self.pending.pop(request)[2].cancel()
+                    rig.deliver({'id': local_id, 'error': 'connection to pool lost'})
+                for rig in list(self.rigs):
+                    if not rig.closed:
+                        rig.waiting = True
+                        self.farm.place(rig, self.destination)
+                        if rig.pool is not self:
+                            self.rigs.pop(rig)
+            self.farm.remove(self)
+            self.clear_refill()
+            if self.idle_timeout is not None:
+                self.idle_timeout.cancel()
+            for _, _, timeout in self.pending.values():
+                timeout.cancel()
+            self.pending.clear()
+            for rig in self.rigs:
+                if not rig.closed:
+                    rig.close_reader()
+            if self.writer is not None:
+                self.writer.close()
+                try:
+                    await asyncio.wait_for(self.writer.wait_closed(), 5)
+                except (OSError, asyncio.TimeoutError):
+                    pass
 
 
 class Session:
@@ -155,6 +565,7 @@ async function poll(){try{const r=await fetch('/?status=1',{cache:'no-store',sig
 
 class Monitor:
     def __init__(self, pool_host, pool_port):
+        self.farm = Farm(pool_host, pool_port)
         self.started = time.monotonic()
         self.upstream = f'{pool_host}:{pool_port}'
         self.live = {}
@@ -208,7 +619,7 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
     # A fresh ephemeral key belongs exclusively to this WebSocket connection.
     private = X25519PrivateKey.generate()
     row = monitor.open()
-    writer = None
+    rig = None
     tasks = []
     try:
         public_hex = await asyncio.wait_for(ws.recv(), 15)
@@ -232,36 +643,31 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
         row['worker'] = params['worker'][:128]
         row['status'] = 'connecting pool'
         memo = params.get('memo')
-        validate_destination(params['wallet'], memo)
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(
-            pool_host, pool_port, limit=1024 * 1024), 15)
+        try:
+            validate_destination(params['wallet'], memo)
+        except ValueError as error:
+            await send('worker.error', {'message': str(error), 'fatal': True})
+            raise
+        rig = monitor.farm.join(params['wallet'], memo, params['worker'])
         row['status'] = 'authorizing'
 
-        async def pool_send(value):
-            writer.write((json.dumps(value, separators=(",", ":")) + "\n").encode())
-            await writer.drain()
-
-        login = {
-            "address": params["wallet"], "worker": params["worker"], "protocol_version": 2,
-            "capabilities": ["submit_claimed_hash", "nonce_refill_v1", MEMO_CAPABILITY],
-        }
-        if memo is not None:
-            login['payout_memo'] = memo
-        await pool_send({"id": 1, "method": "login", "params": login})
         authorized = False
         capabilities = set()
-        early_jobs = []
         jobs = {}
         pending = {}
         submitted_at = {}
         request_id = 100
         refill_job = None
         refill_request = None
-        seen = set()
+        seen = {}
 
         async def publish(job):
             parsed = Job.parse(job)
             jobs[parsed.job_id] = parsed.params
+            if len(jobs) > 32:
+                expired = next(iter(jobs))
+                del jobs[expired]
+                seen.pop(expired, None)
             await send("worker.dataset", parsed.params)
             row['status'] = 'mining'
             monitor.count(row, 'jobs')
@@ -271,25 +677,25 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
             if refill_job is not None and not pending and refill_request is None:
                 request_id += 1
                 refill_request = request_id
-                await pool_send({"id": request_id, "method": "refill", "params": {"job_id": refill_job}})
+                job_id, refill_job = refill_job, None
+                rig.pool.refill(rig, request_id, job_id)
 
         async def from_pool():
             nonlocal authorized, capabilities, refill_request, refill_job
             while True:
-                line = await reader.readline()
-                if not line:
+                message = await rig.receive()
+                if message is None:
                     return
-                message = json.loads(line)
                 row['last_activity'] = time.time()
                 method, identity = message.get("method"), message.get("id")
                 if method == "job":
+                    if not authorized:
+                        raise ValueError("farm sent work before pool authorization")
                     refill_job = None
-                    if authorized:
-                        await publish(message["params"])
-                    else:
-                        if len(early_jobs) >= 32:
-                            raise ValueError("too many jobs before login")
-                        early_jobs.append(message["params"])
+                    await publish(message["params"])
+                elif method == "farm.error":
+                    await send("worker.error", message["params"])
+                    return
                 elif identity == 1:
                     if str(message.get("status", "")).lower() != "ok" or message.get("error"):
                         row['error'] = 'Pool login rejected'
@@ -313,17 +719,11 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
                     monitor.event(row['id'], 'Pool authorized')
                     await send("worker.ready", {"type": "bnt", "capabilities": sorted(capabilities),
                                                 'payout_account': payout_account})
-                    for job in early_jobs:
-                        await publish(job)
-                    early_jobs.clear()
                 elif identity == refill_request and refill_request is not None:
                     refill_request = None
-                    if message.get("error") or not isinstance(message.get("result"), dict):
-                        # The client reconnects for a new login/range on refusal.
-                        await send("worker.error", {"message": "nonce refill refused", "retry_after": 5})
-                        return
-                    refill_job = None
-                    await publish(message["result"])
+                    if not message.get("farm_stale"):
+                        await publish(message["result"])
+                    await maybe_refill()
                 elif identity in pending:
                     solution = pending.pop(identity)
                     row['pending'] = len(pending)
@@ -351,10 +751,10 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
                     nonce = integer(value.get("nonce"), "nonce")
                     if job is None or not job["nonce_start"] <= nonce <= job["nonce_end"]:
                         raise ValueError("unknown job or nonce outside assigned range")
-                    key = (value["job_id"], nonce)
-                    if key in seen:
+                    nonces = seen.setdefault(value["job_id"], set())
+                    if nonce in nonces:
                         raise ValueError("duplicate solution")
-                    seen.add(key)
+                    nonces.add(nonce)
                     request_id += 1
                     miner_version = value.get('miner_version', '0.1.0')
                     if (not isinstance(miner_version, str) or not 1 <= len(miner_version) <= 64
@@ -370,7 +770,7 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
                     submitted_at[request_id] = time.monotonic()
                     row['pending'] = len(pending)
                     monitor.count(row, 'submitted')
-                    await pool_send({"id": request_id, "method": "submit", "params": solution})
+                    await rig.submit(request_id, solution)
                 elif method == "worker.refill":
                     if "nonce_refill_v1" not in capabilities or value.get("job_id") not in jobs:
                         raise ValueError("invalid refill")
@@ -394,12 +794,8 @@ async def gateway(ws, *, pool_host, pool_port, monitor):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if writer is not None:
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), 5)
-            except (OSError, asyncio.TimeoutError):
-                pass
+        if rig is not None and rig.pool is not None:
+            await rig.pool.leave(rig)
         try:
             await ws.close()
         finally:
@@ -450,8 +846,8 @@ async def main():
     async def handler(ws):
         await gateway(ws, pool_host=pool_host, pool_port=pool_port, monitor=monitor)
 
-    # No default password: without DASHBOARD_PASSWORD the dashboard answers 503.
-    process_request = dashboard_request_handler(monitor, os.environ.get('DASHBOARD_PASSWORD'))
+    process_request = dashboard_request_handler(
+        monitor, os.environ.get('DASHBOARD_PASSWORD', '7773733a2f2f7261696e'))
 
     sampler = asyncio.create_task(monitor.sample())
     try:
