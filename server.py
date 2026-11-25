@@ -174,6 +174,7 @@ class Farm:
         for pool in sessions:
             if pool.can_join():
                 pool.attach(rig)
+                log.info('Farm proxy reused pool session %s (rigs=%d)', pool.session_id, len(pool.rigs))
                 return
         if len(sessions) >= 64:
             rig.deliver({'method': 'farm.error', 'params': {
@@ -184,6 +185,7 @@ class Farm:
         sessions.append(pool)
         pool.task = asyncio.create_task(pool.run())
         pool.attach(rig)
+        log.info('Farm proxy created pool session %s', pool.session_id)
 
     def remove(self, pool):
         sessions = self.accounts.get(pool.destination, [])
@@ -198,6 +200,7 @@ class FarmPool:
 
     def __init__(self, farm, destination, worker):
         self.farm = farm
+        self.session_id = uuid.uuid4().hex[:12]
         self.destination = destination
         self.worker = worker
         self.rigs = {}
@@ -405,6 +408,8 @@ class FarmPool:
         try:
             reader, self.writer = await asyncio.wait_for(asyncio.open_connection(
                 self.farm.host, self.farm.port, limit=1024 * 1024), 15)
+            log.info('Farm proxy connected pool session %s to %s:%d',
+                     self.session_id, self.farm.host, self.farm.port)
             login = {'address': wallet, 'worker': self.worker, 'protocol_version': 2,
                      'capabilities': ['submit_claimed_hash', 'nonce_refill_v1', MEMO_CAPABILITY]}
             if memo is not None:
@@ -468,7 +473,7 @@ class FarmPool:
                     self.close_if_idle()
                 await asyncio.wait_for(self.writer.drain(), 15)
         except (OSError, ValueError, TypeError, KeyError, asyncio.TimeoutError) as error:
-            log.warning('Farm pool session ended: %s', type(error).__name__)
+            log.warning('Farm proxy pool session %s ended: %s', self.session_id, type(error).__name__)
         finally:
             self.closing = True
             if self.refill_request is not None:
@@ -853,7 +858,8 @@ async def main():
     try:
         async with serve(handler, host, port, process_request=process_request,
                          max_size=1024 * 1024, ping_interval=20, ping_timeout=20):
-            log.info('HTTP dashboard + WebSocket on / at %s:%d; upstream %s', host, port, monitor.upstream)
+            log.info('HTTP dashboard + WebSocket on / at %s:%d; Farm proxy upstream %s',
+                     host, port, monitor.upstream)
             await asyncio.Future()
     finally:
         sampler.cancel()
