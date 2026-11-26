@@ -27,6 +27,7 @@ from websockets.exceptions import ConnectionClosedOK
 MEMO_CAPABILITY = 'payout_memo_v1'
 KNOWN_EXCHANGE = 'ZJZqGfDPCVg78CRH5Z33CtHafg911Dp5Bauf1Dnxg5jgXx7Whqsvqka96FCV8W6QZXNDKzJefkFU6bwDEGBewqPrTWjij'
 MAX_NONCE = 2**64 - 1
+MAX_WORKERS_PER_SESSION = 10
 
 
 def validate_memo(memo):
@@ -219,7 +220,7 @@ class FarmPool:
         self.next_id = 1
 
     def can_join(self):
-        if self.closing or len(self.rigs) >= 128:
+        if self.closing or len(self.rigs) >= MAX_WORKERS_PER_SESSION:
             return False
         active = self.active_range
         return active is None or active.next_nonce <= active.end or self.can_refill
